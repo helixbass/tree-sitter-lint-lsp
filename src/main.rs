@@ -18,6 +18,7 @@ use tower_lsp::{
 use tree_sitter_lint::{
     tree_sitter::{self, InputEdit, Parser, Point, Tree},
     tree_sitter_grep::{Parseable, SupportedLanguage},
+    ArgsBuilder,
 };
 
 const APPLY_ALL_FIXES_COMMAND: &str = "tree-sitter-lint.applyAllFixes";
@@ -73,7 +74,7 @@ impl Backend {
             &mut cloned_contents,
             Some(&per_file_state.tree),
             "dummy_path",
-            Default::default(),
+            ArgsBuilder::default().fix(true).build().unwrap(),
         );
         self.client
             .apply_edit(WorkspaceEdit {
@@ -263,20 +264,14 @@ fn get_text_document_edits(
     let mut just_seen_remove: Option<String> = None;
     let mut edits: Vec<TextEdit> = Default::default();
     for diff in diffs {
-        let mut should_clear_just_seen_remove = false;
-        if let Some(just_seen_remove) = just_seen_remove.as_ref() {
-            if !matches!(&diff, Difference::Add(_)) {
-                edits.push(TextEdit {
-                    range: byte_offset_range_to_lsp_range(
-                        old_contents,
-                        old_bytes_seen - just_seen_remove.len()..old_bytes_seen,
-                    ),
-                    new_text: Default::default(),
-                });
-                should_clear_just_seen_remove = true;
-            }
-        }
-        if should_clear_just_seen_remove {
+        if just_seen_remove.is_some() && !matches!(&diff, Difference::Add(_)) {
+            edits.push(TextEdit {
+                range: byte_offset_range_to_lsp_range(
+                    old_contents,
+                    old_bytes_seen - just_seen_remove.as_ref().unwrap().len()..old_bytes_seen,
+                ),
+                new_text: Default::default(),
+            });
             just_seen_remove = None;
         }
         match diff {
@@ -286,14 +281,16 @@ fn get_text_document_edits(
                 just_seen_remove = Some(diff);
             }
             Difference::Add(diff) => {
-                if let Some(just_seen_remove) = just_seen_remove.as_ref() {
+                if just_seen_remove.is_some() {
                     edits.push(TextEdit {
                         range: byte_offset_range_to_lsp_range(
                             old_contents,
-                            old_bytes_seen - just_seen_remove.len()..old_bytes_seen,
+                            old_bytes_seen - just_seen_remove.as_ref().unwrap().len()
+                                ..old_bytes_seen,
                         ),
                         new_text: diff,
                     });
+                    just_seen_remove = None;
                 } else {
                     edits.push(TextEdit {
                         range: byte_offset_range_to_lsp_range(
