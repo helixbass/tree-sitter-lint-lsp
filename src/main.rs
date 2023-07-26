@@ -1,11 +1,16 @@
+use std::{borrow::Cow, ops};
+
 use dashmap::DashMap;
 use ropey::Rope;
+use text_diff::Difference;
 use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        InitializeParams, InitializeResult, InitializedParams, NumberOrString, Position, Range,
-        ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        DocumentChanges, InitializeParams, InitializeResult, InitializedParams, NumberOrString,
+        OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, ServerCapabilities,
+        TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+        WorkspaceEdit,
     },
     Client, LanguageServer, LspService, Server,
 };
@@ -56,6 +61,28 @@ impl Backend {
                 None,
             )
             .await;
+    }
+
+    async fn run_fixing_and_report_fixes(&self, uri: &Url) {
+        let per_file_state = self.per_file.get(uri).unwrap();
+        let mut cloned_contents = per_file_state.contents.clone();
+        tree_sitter_lint_local::run_fixing_for_slice(
+            &mut cloned_contents,
+            Some(&per_file_state.tree),
+            "dummy_path",
+            Default::default(),
+        );
+        self.client
+            .apply_edit(WorkspaceEdit {
+                document_changes: Some(DocumentChanges::Edits(vec![get_text_document_edits(
+                    &per_file_state.contents,
+                    &cloned_contents,
+                    uri,
+                )])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
     }
 }
 
@@ -187,10 +214,91 @@ fn byte_offset_to_point(file_contents: &Rope, byte_offset: usize) -> Point {
     }
 }
 
-fn tree_sitter_range_to_lsp_range(file_contents: &Rope, range: tree_sitter::Range) -> Range {
+fn byte_offset_to_position(file_contents: &Rope, byte_offset: usize) -> Position {
+    point_to_position(byte_offset_to_point(file_contents, byte_offset))
+}
+
+fn byte_offset_range_to_lsp_range(file_contents: &Rope, range: ops::Range<usize>) -> Range {
     Range {
-        start: point_to_position(byte_offset_to_point(file_contents, range.start_byte)),
-        end: point_to_position(byte_offset_to_point(file_contents, range.end_byte)),
+        start: byte_offset_to_position(file_contents, range.start),
+        end: byte_offset_to_position(file_contents, range.end),
+    }
+}
+
+fn tree_sitter_range_to_lsp_range(file_contents: &Rope, range: tree_sitter::Range) -> Range {
+    byte_offset_range_to_lsp_range(file_contents, range.start_byte..range.end_byte)
+}
+
+fn get_text_document_edits(
+    old_contents: &Rope,
+    new_contents: &Rope,
+    uri: &Url,
+) -> TextDocumentEdit {
+    let old_contents_as_str: Cow<'_, str> = old_contents.clone().into();
+    let new_contents_as_str: Cow<'_, str> = new_contents.clone().into();
+    let (_, diffs) = text_diff::diff(&old_contents_as_str, &new_contents_as_str, "");
+    let mut old_bytes_seen = 0;
+    let mut just_seen_remove: Option<String> = None;
+    let mut edits: Vec<TextEdit> = Default::default();
+    for diff in diffs {
+        let mut should_clear_just_seen_remove = false;
+        if let Some(just_seen_remove) = just_seen_remove.as_ref() {
+            if !matches!(&diff, Difference::Add(_)) {
+                edits.push(TextEdit {
+                    range: byte_offset_range_to_lsp_range(
+                        old_contents,
+                        old_bytes_seen - just_seen_remove.len()..old_bytes_seen,
+                    ),
+                    new_text: Default::default(),
+                });
+                should_clear_just_seen_remove = true;
+            }
+        }
+        if should_clear_just_seen_remove {
+            just_seen_remove = None;
+        }
+        match diff {
+            Difference::Same(diff) => old_bytes_seen += diff.len(),
+            Difference::Rem(diff) => {
+                old_bytes_seen += diff.len();
+                just_seen_remove = Some(diff);
+            }
+            Difference::Add(diff) => {
+                if let Some(just_seen_remove) = just_seen_remove.as_ref() {
+                    edits.push(TextEdit {
+                        range: byte_offset_range_to_lsp_range(
+                            old_contents,
+                            old_bytes_seen - just_seen_remove.len()..old_bytes_seen,
+                        ),
+                        new_text: diff,
+                    });
+                } else {
+                    edits.push(TextEdit {
+                        range: byte_offset_range_to_lsp_range(
+                            old_contents,
+                            old_bytes_seen..old_bytes_seen,
+                        ),
+                        new_text: diff,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(just_seen_remove) = just_seen_remove.as_ref() {
+        edits.push(TextEdit {
+            range: byte_offset_range_to_lsp_range(
+                old_contents,
+                old_bytes_seen..old_bytes_seen + just_seen_remove.len(),
+            ),
+            new_text: Default::default(),
+        });
+    }
+    TextDocumentEdit {
+        text_document: OptionalVersionedTextDocumentIdentifier {
+            uri: uri.clone(),
+            version: None,
+        },
+        edits: edits.into_iter().map(OneOf::Left).collect(),
     }
 }
 
