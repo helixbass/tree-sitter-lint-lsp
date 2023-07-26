@@ -3,14 +3,15 @@ use ropey::Rope;
 use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
-        DidChangeTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, InitializeResult,
-        InitializedParams, MessageType, Position, Url,
+        Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+        InitializeParams, InitializeResult, InitializedParams, MessageType, Position, Range,
+        ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     },
     Client, LanguageServer, LspService, Server,
 };
 use tree_sitter_lint::{
-    tree_sitter::{InputEdit, Parser, Point, Tree},
-    tree_sitter_grep::SupportedLanguage,
+    tree_sitter::{self, InputEdit, Parser, Point, Tree},
+    tree_sitter_grep::{Parseable, SupportedLanguage},
 };
 
 #[derive(Debug)]
@@ -26,17 +27,54 @@ impl Backend {
             per_file: Default::default(),
         }
     }
+
+    async fn run_linting_and_report_diagnostics(&self, uri: &Url) {
+        let per_file_state = self.per_file.get(uri).unwrap();
+        let violations = tree_sitter_lint_local::run_for_slice(
+            &per_file_state.contents,
+            Some(&per_file_state.tree),
+            "dummy_path",
+            Default::default(),
+        );
+        self.client
+            .publish_diagnostics(
+                uri.clone(),
+                violations
+                    .into_iter()
+                    .map(|violation| Diagnostic {
+                        message: violation.message,
+                        range: tree_sitter_range_to_lsp_range(
+                            &per_file_state.contents,
+                            violation.range,
+                        ),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some(format!("[{}]", violation.rule.name)),
+                        ..Default::default()
+                    })
+                    .collect(),
+                None,
+            )
+            .await;
+    }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
-        Ok(Default::default())
+        Ok(InitializeResult {
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::INCREMENTAL,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     }
 
     async fn initialized(&self, _: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "server initialized!")
+            .log_message(MessageType::ERROR, "server initialized!")
             .await;
     }
 
@@ -45,17 +83,26 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.client
+            .log_message(MessageType::ERROR, "whee opened")
+            .await;
         let contents: Rope = (&*params.text_document.text).into();
         self.per_file.insert(
-            params.text_document.uri,
+            params.text_document.uri.clone(),
             PerFileState {
                 tree: parse_from_scratch(&contents),
                 contents,
             },
         );
+
+        self.run_linting_and_report_diagnostics(&params.text_document.uri)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        self.client
+            .log_message(MessageType::ERROR, "whee changed")
+            .await;
         let mut file_state = self
             .per_file
             .get_mut(&params.text_document.uri)
@@ -109,15 +156,16 @@ fn parse(contents: &Rope, old_tree: Option<&Tree>) -> Tree {
     parser
         .set_language(SupportedLanguage::Rust.language())
         .unwrap();
-    parser
-        .parse_with(
-            &mut |byte_offset, _| {
-                let (chunk, chunk_start_byte_index, _, _) = contents.chunk_at_byte(byte_offset);
-                &chunk[byte_offset - chunk_start_byte_index..]
-            },
-            old_tree,
-        )
-        .unwrap()
+    contents.parse(&mut parser, old_tree).unwrap()
+    // parser
+    //     .parse_with(
+    //         &mut |byte_offset, _| {
+    //             let (chunk, chunk_start_byte_index, _, _) = contents.chunk_at_byte(byte_offset);
+    //             &chunk[byte_offset - chunk_start_byte_index..]
+    //         },
+    //         old_tree,
+    //     )
+    //     .unwrap()
 }
 
 fn lsp_position_to_char_offset(file_contents: &Rope, position: Position) -> usize {
@@ -131,12 +179,26 @@ fn position_to_point(position: Position) -> Point {
     }
 }
 
+fn point_to_position(point: Point) -> Position {
+    Position {
+        line: point.row as u32,
+        character: point.column as u32,
+    }
+}
+
 fn byte_offset_to_point(file_contents: &Rope, byte_offset: usize) -> Point {
     let line_num = file_contents.byte_to_line(byte_offset);
     let start_of_line_byte_offset = file_contents.line_to_byte(line_num);
     Point {
         row: line_num,
         column: byte_offset - start_of_line_byte_offset,
+    }
+}
+
+fn tree_sitter_range_to_lsp_range(file_contents: &Rope, range: tree_sitter::Range) -> Range {
+    Range {
+        start: point_to_position(byte_offset_to_point(file_contents, range.start_byte)),
+        end: point_to_position(byte_offset_to_point(file_contents, range.end_byte)),
     }
 }
 
