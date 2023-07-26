@@ -1,18 +1,27 @@
+use std::{borrow::Cow, ops};
+
 use dashmap::DashMap;
 use ropey::Rope;
+use text_diff::Difference;
 use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        InitializeParams, InitializeResult, InitializedParams, NumberOrString, Position, Range,
-        ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+        DocumentChanges, ExecuteCommandOptions, ExecuteCommandParams, InitializeParams,
+        InitializeResult, InitializedParams, NumberOrString, OneOf,
+        OptionalVersionedTextDocumentIdentifier, Position, Range, ServerCapabilities,
+        TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+        WorkspaceEdit,
     },
     Client, LanguageServer, LspService, Server,
 };
 use tree_sitter_lint::{
     tree_sitter::{self, InputEdit, Parser, Point, Tree},
     tree_sitter_grep::{Parseable, SupportedLanguage},
+    ArgsBuilder,
 };
+
+const APPLY_ALL_FIXES_COMMAND: &str = "tree-sitter-lint.applyAllFixes";
 
 #[derive(Debug)]
 struct Backend {
@@ -57,6 +66,28 @@ impl Backend {
             )
             .await;
     }
+
+    async fn run_fixing_and_report_fixes(&self, uri: &Url) {
+        let per_file_state = self.per_file.get(uri).unwrap();
+        let mut cloned_contents = per_file_state.contents.clone();
+        tree_sitter_lint_local::run_fixing_for_slice(
+            &mut cloned_contents,
+            Some(&per_file_state.tree),
+            "dummy_path",
+            ArgsBuilder::default().fix(true).build().unwrap(),
+        );
+        self.client
+            .apply_edit(WorkspaceEdit {
+                document_changes: Some(DocumentChanges::Edits(vec![get_text_document_edits(
+                    &per_file_state.contents,
+                    &cloned_contents,
+                    uri,
+                )])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -67,6 +98,10 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![APPLY_ALL_FIXES_COMMAND.to_owned()],
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -140,6 +175,21 @@ impl LanguageServer for Backend {
         self.run_linting_and_report_diagnostics(&params.text_document.uri)
             .await;
     }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        match &*params.command {
+            APPLY_ALL_FIXES_COMMAND => {
+                self.run_fixing_and_report_fixes(&get_uri_from_arguments(&params.arguments))
+                    .await;
+            }
+            command => panic!("Unknown command: {:?}", command),
+        }
+
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
@@ -187,10 +237,97 @@ fn byte_offset_to_point(file_contents: &Rope, byte_offset: usize) -> Point {
     }
 }
 
-fn tree_sitter_range_to_lsp_range(file_contents: &Rope, range: tree_sitter::Range) -> Range {
+fn byte_offset_to_position(file_contents: &Rope, byte_offset: usize) -> Position {
+    point_to_position(byte_offset_to_point(file_contents, byte_offset))
+}
+
+fn byte_offset_range_to_lsp_range(file_contents: &Rope, range: ops::Range<usize>) -> Range {
     Range {
-        start: point_to_position(byte_offset_to_point(file_contents, range.start_byte)),
-        end: point_to_position(byte_offset_to_point(file_contents, range.end_byte)),
+        start: byte_offset_to_position(file_contents, range.start),
+        end: byte_offset_to_position(file_contents, range.end),
+    }
+}
+
+fn tree_sitter_range_to_lsp_range(file_contents: &Rope, range: tree_sitter::Range) -> Range {
+    byte_offset_range_to_lsp_range(file_contents, range.start_byte..range.end_byte)
+}
+
+fn get_text_document_edits(
+    old_contents: &Rope,
+    new_contents: &Rope,
+    uri: &Url,
+) -> TextDocumentEdit {
+    let old_contents_as_str: Cow<'_, str> = old_contents.clone().into();
+    let new_contents_as_str: Cow<'_, str> = new_contents.clone().into();
+    let (_, diffs) = text_diff::diff(&old_contents_as_str, &new_contents_as_str, "");
+    let mut old_bytes_seen = 0;
+    let mut just_seen_remove: Option<String> = None;
+    let mut edits: Vec<TextEdit> = Default::default();
+    for diff in diffs {
+        if just_seen_remove.is_some() && !matches!(&diff, Difference::Add(_)) {
+            edits.push(TextEdit {
+                range: byte_offset_range_to_lsp_range(
+                    old_contents,
+                    old_bytes_seen - just_seen_remove.as_ref().unwrap().len()..old_bytes_seen,
+                ),
+                new_text: Default::default(),
+            });
+            just_seen_remove = None;
+        }
+        match diff {
+            Difference::Same(diff) => old_bytes_seen += diff.len(),
+            Difference::Rem(diff) => {
+                old_bytes_seen += diff.len();
+                just_seen_remove = Some(diff);
+            }
+            Difference::Add(diff) => {
+                if just_seen_remove.is_some() {
+                    edits.push(TextEdit {
+                        range: byte_offset_range_to_lsp_range(
+                            old_contents,
+                            old_bytes_seen - just_seen_remove.as_ref().unwrap().len()
+                                ..old_bytes_seen,
+                        ),
+                        new_text: diff,
+                    });
+                    just_seen_remove = None;
+                } else {
+                    edits.push(TextEdit {
+                        range: byte_offset_range_to_lsp_range(
+                            old_contents,
+                            old_bytes_seen..old_bytes_seen,
+                        ),
+                        new_text: diff,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(just_seen_remove) = just_seen_remove.as_ref() {
+        edits.push(TextEdit {
+            range: byte_offset_range_to_lsp_range(
+                old_contents,
+                old_bytes_seen..old_bytes_seen + just_seen_remove.len(),
+            ),
+            new_text: Default::default(),
+        });
+    }
+    TextDocumentEdit {
+        text_document: OptionalVersionedTextDocumentIdentifier {
+            uri: uri.clone(),
+            version: None,
+        },
+        edits: edits.into_iter().map(OneOf::Left).collect(),
+    }
+}
+
+fn get_uri_from_arguments(arguments: &[serde_json::Value]) -> Url {
+    if arguments.len() != 1 {
+        panic!("Expected to get passed a single file description");
+    }
+    match &arguments[0] {
+        serde_json::Value::Object(map) => map["uri"].as_str().unwrap().try_into().unwrap(),
+        _ => panic!("Expected file description to be object"),
     }
 }
 
