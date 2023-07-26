@@ -7,8 +7,9 @@ use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        DocumentChanges, InitializeParams, InitializeResult, InitializedParams, NumberOrString,
-        OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, ServerCapabilities,
+        DocumentChanges, ExecuteCommandOptions, ExecuteCommandParams, InitializeParams,
+        InitializeResult, InitializedParams, NumberOrString, OneOf,
+        OptionalVersionedTextDocumentIdentifier, Position, Range, ServerCapabilities,
         TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
         WorkspaceEdit,
     },
@@ -18,6 +19,8 @@ use tree_sitter_lint::{
     tree_sitter::{self, InputEdit, Parser, Point, Tree},
     tree_sitter_grep::{Parseable, SupportedLanguage},
 };
+
+const APPLY_ALL_FIXES_COMMAND: &str = "tree-sitter-lint.applyAllFixes";
 
 #[derive(Debug)]
 struct Backend {
@@ -94,6 +97,10 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![APPLY_ALL_FIXES_COMMAND.to_owned()],
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -166,6 +173,21 @@ impl LanguageServer for Backend {
 
         self.run_linting_and_report_diagnostics(&params.text_document.uri)
             .await;
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        match &*params.command {
+            APPLY_ALL_FIXES_COMMAND => {
+                self.run_fixing_and_report_fixes(&get_uri_from_arguments(&params.arguments))
+                    .await;
+            }
+            command => panic!("Unknown command: {:?}", command),
+        }
+
+        Ok(None)
     }
 }
 
@@ -299,6 +321,16 @@ fn get_text_document_edits(
             version: None,
         },
         edits: edits.into_iter().map(OneOf::Left).collect(),
+    }
+}
+
+fn get_uri_from_arguments(arguments: &[serde_json::Value]) -> Url {
+    if arguments.len() != 1 {
+        panic!("Expected to get passed a single file description");
+    }
+    match &arguments[0] {
+        serde_json::Value::Object(map) => map["uri"].as_str().unwrap().try_into().unwrap(),
+        _ => panic!("Expected file description to be object"),
     }
 }
 
