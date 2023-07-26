@@ -4,7 +4,7 @@ use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-        InitializeParams, InitializeResult, InitializedParams, MessageType, Position, Range,
+        InitializeParams, InitializeResult, InitializedParams, NumberOrString, Position, Range,
         ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     },
     Client, LanguageServer, LspService, Server,
@@ -48,7 +48,8 @@ impl Backend {
                             violation.range,
                         ),
                         severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some(format!("[{}]", violation.rule.name)),
+                        code: Some(NumberOrString::String(violation.rule.name)),
+                        source: Some("tree-sitter-lint".to_owned()),
                         ..Default::default()
                     })
                     .collect(),
@@ -73,9 +74,9 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.client
-            .log_message(MessageType::ERROR, "server initialized!")
-            .await;
+        // self.client
+        //     .log_message(MessageType::INFO, "server initialized!")
+        //     .await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -83,9 +84,6 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.client
-            .log_message(MessageType::ERROR, "whee opened")
-            .await;
         let contents: Rope = (&*params.text_document.text).into();
         self.per_file.insert(
             params.text_document.uri.clone(),
@@ -100,9 +98,6 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        self.client
-            .log_message(MessageType::ERROR, "whee changed")
-            .await;
         let mut file_state = self
             .per_file
             .get_mut(&params.text_document.uri)
@@ -157,15 +152,6 @@ fn parse(contents: &Rope, old_tree: Option<&Tree>) -> Tree {
         .set_language(SupportedLanguage::Rust.language())
         .unwrap();
     contents.parse(&mut parser, old_tree).unwrap()
-    // parser
-    //     .parse_with(
-    //         &mut |byte_offset, _| {
-    //             let (chunk, chunk_start_byte_index, _, _) = contents.chunk_at_byte(byte_offset);
-    //             &chunk[byte_offset - chunk_start_byte_index..]
-    //         },
-    //         old_tree,
-    //     )
-    //     .unwrap()
 }
 
 fn lsp_position_to_char_offset(file_contents: &Rope, position: Position) -> usize {
